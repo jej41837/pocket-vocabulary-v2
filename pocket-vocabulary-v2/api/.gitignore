@@ -1,0 +1,10 @@
+# 환경 변수 및 API 키 파일
+.env
+.env.example
+.env.*
+
+# Node 패키지 및 빌드 폴더
+node_modules/
+dist/
+build/
+.DS_Store
