@@ -1,6 +1,7 @@
 import { GoogleGenAI } from "@google/genai";
 
-const MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
+const DEFAULT_MODEL = "gemini-2.5-flash";
+const MODEL = process.env.GEMINI_MODEL || DEFAULT_MODEL;
 
 function send(res, status, payload) {
   res.status(status).json(payload);
@@ -34,33 +35,34 @@ function normalizeList(value) {
   return [];
 }
 
-function normalizeEnrichment(data) {
+function normalizeText(value) {
+  return (Array.isArray(value) ? value : [value])
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+function definitionsFor(meanings, value) {
+  const definitions = Array.isArray(value) ? value : [];
+  return meanings.map((meaning, index) => {
+    const item = definitions[index];
+    return typeof item === "string" ? item.trim() : String(item?.definition || "").trim();
+  });
+}
+
+function normalizeEnrichment(data, meanings) {
+  const definitions = definitionsFor(meanings, data.definitions);
   return {
-    definition: normalizeList(data.definition || data.definitions).join("\n"),
-    example: normalizeList(data.example || data.examples).join("\n"),
+    definitions,
+    definition: definitions.join("\n"),
+    example: normalizeText(data.example || data.examples),
+    exampleKo: normalizeText(data.exampleKo || data.koreanExample),
+    exampleMeaning: String(data.exampleMeaning || "").trim(),
     synonyms: normalizeList(data.synonyms).join(", "),
     antonyms: normalizeList(data.antonyms).join(", "),
     derived: normalizeList(data.derived || data.derivatives).join(", "),
     related: normalizeList(data.related || data.relatedWords).join(", ")
   };
-}
-
-async function dictionaryLookup(word) {
-  try {
-    const response = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(word)}`);
-    if (!response.ok) return {};
-    const entries = await response.json();
-    const meanings = (Array.isArray(entries) ? entries : []).flatMap((entry) => entry.meanings || []);
-    const definitions = meanings.flatMap((meaning) => meaning.definitions || []);
-    return {
-      definition: definitions.map((item) => item.definition).filter(Boolean).slice(0, 3).join("\n"),
-      example: definitions.map((item) => item.example).filter(Boolean).slice(0, 3).join("\n"),
-      synonyms: [...new Set(meanings.flatMap((item) => item.synonyms || []).concat(definitions.flatMap((item) => item.synonyms || [])))].slice(0, 8).join(", "),
-      antonyms: [...new Set(meanings.flatMap((item) => item.antonyms || []).concat(definitions.flatMap((item) => item.antonyms || [])))].slice(0, 8).join(", ")
-    };
-  } catch {
-    return {};
-  }
 }
 
 function normalizeOcr(data) {
@@ -71,9 +73,12 @@ function normalizeOcr(data) {
     .map((row) => ({
       word: String(row.word || row.english || "").trim(),
       meanings: normalizeList(row.meanings || row.meaning || row.korean),
+      definitions: Array.isArray(row.definitions) ? row.definitions.map((item) => String(item || "").trim()) : [],
       details: {
-        definition: normalizeList(row.definition || row.definitions).join("\n"),
-        example: normalizeList(row.example || row.examples).join("\n"),
+        definition: "",
+        example: normalizeText(row.example || row.examples),
+        exampleKo: normalizeText(row.exampleKo || row.koreanExample || row.koreanExamples),
+        exampleMeaning: String(row.exampleMeaning || "").trim(),
         synonyms: normalizeList(row.synonyms).join(", "),
         antonyms: normalizeList(row.antonyms).join(", "),
         derived: normalizeList(row.derived || row.derivatives).join(", "),
@@ -84,14 +89,16 @@ function normalizeOcr(data) {
 }
 
 async function generateJson(ai, contents) {
-  const response = await ai.models.generateContent({
-    model: MODEL,
-    contents,
-    config: {
-      responseMimeType: "application/json",
-      temperature: 0.15
-    }
+  const request = (model) => ai.models.generateContent({
+    model, contents,
+    config: { responseMimeType: "application/json", temperature: 0.15 }
   });
+  let response;
+  try { response = await request(MODEL); }
+  catch (error) {
+    if (MODEL !== DEFAULT_MODEL && (error?.status === 404 || error?.code === 404)) response = await request(DEFAULT_MODEL);
+    else throw error;
+  }
   return parseJson(response.text);
 }
 
@@ -117,18 +124,30 @@ export default async function handler(req, res) {
     if (type === "enrich") {
       const word = String(req.body.word || "").trim();
       const meanings = normalizeList(req.body.meanings || req.body.meaning);
+      const existingExample = String(req.body.example || "").trim();
       if (!word) return send(res, 400, { error: "영어 단어가 필요합니다." });
 
-      const prompt = `영어 단어장 데이터를 생성하세요.\n단어: ${word}\n한국어 뜻: ${meanings.join(", ") || "미입력"}\n\nJSON 객체만 반환하세요:\n{\n  "definition": ["간결한 영영풀이"],\n  "examples": ["자연스러운 영어 예문"],\n  "synonyms": ["동의어"],\n  "antonyms": ["반의어"],\n  "derivatives": ["실제로 존재하는 파생어"],\n  "relatedWords": ["직접 관련된 유의어 또는 관련어"]\n}\n규칙: 품사와 입력 뜻에 맞는 항목만 작성하고, 확실하지 않으면 빈 배열을 사용하세요. 만든 단어, 억지 파생어, 관계없는 단어는 절대 넣지 마세요. 예문에는 주어진 단어 또는 자연스러운 활용형을 포함하세요.`;
+      const prompt = `영어 단어장 데이터를 생성하세요.
+영어 단어: ${word}
+한국어 뜻(순서 유지): ${JSON.stringify(meanings)}
+기존 영어 예문: ${existingExample || "없음"}
+
+JSON 객체만 반환하세요:
+{
+  "definitions": ["첫 번째 한국어 뜻에 해당하는 영어 풀이", "두 번째 한국어 뜻에 해당하는 영어 풀이"],
+  "example": "단어가 포함된 자연스러운 영어 예문 한 문장",
+  "exampleKo": "영어 예문의 한국어 번역",
+  "exampleMeaning": "한국어 예문에 실제로 적힌 뜻 표현",
+  "synonyms": [], "antonyms": [], "derivatives": [], "relatedWords": []
+}
+definitions는 한국어 뜻과 정확히 같은 길이와 순서의 배열로 작성하세요. 각 풀이가 그 뜻의 의미를 구별하도록 구체적으로 쓰고, 해당 뜻을 설명할 수 없으면 그 자리에는 빈 문자열을 넣으세요. 다른 뜻의 풀이를 복사하거나 동일한 풀이를 반복하지 마세요. 기존 예문이 있으면 그대로 사용하고 번역하세요. 확실하지 않은 다른 정보는 빈 값이나 빈 배열을 사용하세요.`;
       const data = await generateJson(ai, prompt);
-      const generated = normalizeEnrichment(data);
-      const dictionary = await dictionaryLookup(word);
+      const generated = normalizeEnrichment(data, meanings);
       return send(res, 200, {
         ...generated,
-        definition: dictionary.definition || generated.definition,
-        example: dictionary.example || generated.example,
-        synonyms: dictionary.synonyms || generated.synonyms,
-        antonyms: dictionary.antonyms || generated.antonyms
+        example: existingExample || generated.example,
+        exampleKo: generated.exampleKo,
+        exampleMeaning: generated.exampleMeaning
       });
     }
 
@@ -137,7 +156,7 @@ export default async function handler(req, res) {
       const match = image.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
       if (!match) return send(res, 400, { error: "올바른 이미지 데이터가 아닙니다." });
 
-      const prompt = `이 이미지는 형식이 일정하지 않은 영어 단어장입니다. 위치, 줄바꿈, 표, 번호, 괄호가 뒤섞여 있어도 전체 문맥을 보고 각 영어 표제어에 실제로 연결된 정보를 재구성하세요. 사진에 인쇄된 한국어 뜻, 영영풀이, 예문, 동의어, 반의어, 파생어, 유의어/관련어가 있다면 해당 단어에 연결해 그대로 보존하세요. 사진에 없는 정보는 추측하거나 생성하지 말고 빈 배열을 사용하세요. 품사와 번호는 뜻으로 오인하지 마세요.\n\n다음 JSON 배열만 반환하세요:\n[{"word":"영어 표제어","meanings":["한국어 뜻"],"definitions":["사진에 있는 영영풀이"],"examples":["사진에 있는 예문"],"synonyms":["사진에 있는 동의어"],"antonyms":["사진에 있는 반의어"],"derivatives":["사진에 있는 파생어"],"relatedWords":["사진에 있는 관련어"]}]`;
+      const prompt = `이 이미지는 형식이 일정하지 않은 영어 단어장입니다. 위치, 줄바꿈, 표, 번호, 괄호가 뒤섞여 있어도 전체 문맥을 보고 각 영어 표제어에 실제로 연결된 정보를 재구성하세요. 사진에 인쇄된 한국어 뜻, 영영풀이, 영어 예문, 한국어 예문, 동의어, 반의어, 파생어, 유의어/관련어가 있다면 해당 단어에 연결해 그대로 보존하세요. 사진에 없는 정보는 추측하거나 생성하지 말고 빈 값이나 빈 배열을 사용하세요. 품사와 번호는 뜻으로 오인하지 마세요.\n\n다음 JSON 배열만 반환하세요:\n[{"word":"영어 표제어","meanings":["한국어 뜻"],"definitions":["사진에 있는 영영풀이"],"example":"사진에 있는 영어 예문","exampleKo":"사진에 있는 한국어 예문","exampleMeaning":"한국어 예문에 실제로 적힌 단어 뜻 표현","synonyms":["사진에 있는 동의어"],"antonyms":["사진에 있는 반의어"],"derivatives":["사진에 있는 파생어"],"relatedWords":["사진에 있는 관련어"]}]`;
       const data = await generateJson(ai, [
         { inlineData: { mimeType: match[1], data: match[2] } },
         { text: prompt }
